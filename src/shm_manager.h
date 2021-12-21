@@ -24,51 +24,94 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#pragma once
-
-#include <unistd.h>
+#include <boost/interprocess/managed_external_buffer.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/interprocess/shared_memory_object.hpp>
-#include <boost/interprocess/sync/interprocess_mutex.hpp>
-#include <memory>
-#include <string>
-#include <utility>
+#include <iostream>
 #include <vector>
+
+#pragma once
+
+namespace bi = boost::interprocess;
 
 
 namespace triton { namespace backend { namespace python {
-
 class SharedMemory {
-  std::string shm_key_;
-  size_t* capacity_;
-  off_t* offset_;
-  char* shm_addr_;
-  boost::interprocess::interprocess_mutex* shm_mutex_;
-
-  // Current capcity, local to each process.
-  size_t current_capacity_;
-
-  // Amount of bytes to grow the shared memory when the pool is completely used.
-  int64_t shm_growth_bytes_;
-
-  // Get the amount of shared memory available.
-  size_t GetAvailableSharedMemory();
-  boost::interprocess::shared_memory_object shm_obj_;
-  std::unique_ptr<boost::interprocess::mapped_region> shm_map_;
-  std::vector<std::unique_ptr<boost::interprocess::mapped_region>>
-      old_shm_maps_;
-
-  void UpdateSharedMemory();
-
  public:
+  template <typename T>
+  struct AllocatedSharedMemory {
+    T* ptr;
+    bi::managed_external_buffer::handle_t handle;
+  };
+
   SharedMemory(
-      const std::string& shm_key, int64_t default_byte_size,
-      int64_t shm_growth_bytes, bool truncate = false);
-  void MapOffset(char** shm_addr, off_t offset);
-  void Map(char** shm_addr, size_t byte_size, off_t& offset);
-  off_t Offset();
-  void SetOffset(off_t offset);
+      const std::string& shm_region_name, int64_t shm_default_size, bool create,
+      int64_t shm_growth_size);
+
+  template <typename T>
+  std::unique_ptr<AllocatedSharedMemory<T>> Allocate(size_t number)
+  {
+  }
+
+  template <typename T>
+  std::unique_ptr<AllocatedSharedMemory<T>> Allocate()
+  {
+    bi::scoped_lock<bi::interprocess_mutex> gaurd{*shm_mutex_};
+
+    GrowIfNeeded(sizeof(T));
+    void* memory = managed_buffer_->allocate(sizeof(T));
+
+    auto allocated_shared_memory = std::make_unique<AllocatedSharedMemory<T>>();
+    allocated_shared_memory->ptr = reinterpret_cast<T*>(memory);
+    allocated_shared_memory->handle =
+        managed_buffer_->get_handle_from_address(memory);
+    return allocated_shared_memory;
+  }
+
+  template <typename T>
+  void Deallocate(std::unique_ptr<AllocatedSharedMemory<T>>&& allocated_memory)
+  {
+    bi::scoped_lock<bi::interprocess_mutex> gaurd{*shm_mutex_};
+
+    GrowIfNeeded(0);
+    size_t shm_map_sizes = old_shm_maps_.size();
+    void* ptr =
+        managed_buffer_->get_address_from_handle(allocated_memory->handle);
+    managed_buffer_->deallocate(ptr);
+  }
+
+  template <typename T>
+  std::unique_ptr<AllocatedSharedMemory<T>> Load(
+      bi::managed_external_buffer::handle_t handle)
+  {
+    bi::scoped_lock<bi::interprocess_mutex> gaurd{*shm_mutex_};
+
+    GrowIfNeeded(0);
+    void* address = managed_buffer_->get_address_from_handle(handle);
+    std::unique_ptr<AllocatedSharedMemory<T>> allocated_shared_memory =
+        std::make_unique<AllocatedSharedMemory<T>>();
+    allocated_shared_memory->ptr = reinterpret_cast<T>(address);
+    allocated_shared_memory->handle = handle;
+
+    return allocated_shared_memory;
+  }
+
+  size_t FreeMemory();
   ~SharedMemory() noexcept(false);
+
+ private:
+  std::string shm_region_name_;
+  std::unique_ptr<bi::managed_external_buffer> managed_buffer_;
+  std::unique_ptr<bi::shared_memory_object> shm_obj_;
+  std::shared_ptr<bi::mapped_region> shm_map_;
+  std::vector<std::shared_ptr<bi::mapped_region>> old_shm_maps_;
+  int64_t default_size_;
+  int64_t growth_size_;
+  size_t current_capacity_;
+  bi::interprocess_mutex* shm_mutex_;
+  size_t shm_growth_bytes_;
+  bool create_;
+  void GrowIfNeeded(size_t bytes);
 };
 
 }}}  // namespace triton::backend::python
